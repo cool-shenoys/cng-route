@@ -25,7 +25,7 @@ const LS = {
 const S = Object.assign({
   places: [{label: "My location", gps: true}, null],   // first = start, last = destination
   vehicle: {range: 200, reserve: 30, fill: 100, detour: 3},
-  home: null, trip: null, sheetMin: false,
+  home: null, trip: null, panelHidden: false, theme: "auto",
 }, LS.get("state", {}));
 let FB = LS.get("feedback", []);
 const save = () => LS.set("state", S);
@@ -176,8 +176,43 @@ async function buildTrip(start, fill, targets, prev) {
   return trip;
 }
 
-// ---------- search (Photon) ----------
+// ---------- search: Google Places when the user has added a key, else Photon ----------
+const GKEY = () => LS.get("gkey", "");
+let gSession = null;
 async function geocode(q) {
+  if (GKEY()) {
+    try { return await googleSuggest(q); } catch (e) { console.warn("Google search failed, using Photon", e); }
+  }
+  return photon(q);
+}
+
+async function googleSuggest(q) {
+  const c = map.getCenter();
+  gSession ||= crypto.randomUUID();
+  const r = await fetch("https://places.googleapis.com/v1/places:autocomplete", {
+    method: "POST", headers: {"Content-Type": "application/json", "X-Goog-Api-Key": GKEY()},
+    body: JSON.stringify({input: q, includedRegionCodes: ["in"], languageCode: "en", sessionToken: gSession,
+      locationBias: {circle: {center: {latitude: c.lat, longitude: c.lng}, radius: 50000}}}),
+  });
+  if (!r.ok) throw new Error("places " + r.status);
+  const j = await r.json();
+  return (j.suggestions || []).filter(s => s.placePrediction).map(s => {
+    const p = s.placePrediction;
+    return {label: p.structuredFormat?.mainText?.text || p.text.text, sub: p.structuredFormat?.secondaryText?.text || "", placeId: p.placeId};
+  });
+}
+
+async function googlePlace(placeId) {
+  const r = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}?sessionToken=${gSession || ""}`, {
+    headers: {"X-Goog-Api-Key": GKEY(), "X-Goog-FieldMask": "location,displayName,formattedAddress"},
+  });
+  gSession = null; // a session ends when a place is picked
+  if (!r.ok) throw new Error("Couldn't look up that place. Try again.");
+  const p = await r.json();
+  return {lat: p.location.latitude, lon: p.location.longitude};
+}
+
+async function photon(q) {
   const c = map.getCenter();
   const u = `https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=6&lang=en&lat=${c.lat.toFixed(3)}&lon=${c.lng.toFixed(3)}&bbox=68,6,97.5,37.5`;
   const r = await fetch(u);
@@ -205,11 +240,58 @@ async function resolvePlace(p) {
 }
 
 // ---------- map ----------
-const dark = matchMedia("(prefers-color-scheme: dark)").matches;
 const map = L.map("map", {zoomControl: false, preferCanvas: true, attributionControl: true}).setView([21.5, 78.9], 5);
-L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  maxZoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-}).addTo(map);
+
+/* Base map. India's official boundary must show everywhere:
+   - with a Google key: Google Map Tiles, region IN (Google renders India's official boundaries for region IN);
+   - without: Bhuvan (ISRO, Govt of India) for the national view and for all of J&K/Ladakh at street level,
+     OpenStreetMap for street detail elsewhere. OSM draws international de-facto lines, which only matter
+     inside the J&K box, so that box is always drawn from Bhuvan/MapmyIndia layers on top. */
+const BHUVAN = "https://bhuvan-vec1.nrsc.gov.in/bhuvan/gwc/service/wms";
+const BhuvanLayer = L.TileLayer.extend({
+  getTileUrl(c) {
+    const o = 20037508.342789244, s = 2 * o / 2 ** c.z;
+    const bbox = [-o + c.x * s, o - (c.y + 1) * s, -o + (c.x + 1) * s, o - c.y * s].join(",");
+    return `${BHUVAN}?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=${this.options.layer}&STYLES=&SRS=EPSG:900913&BBOX=${bbox}&WIDTH=256&HEIGHT=256&FORMAT=image/png&TRANSPARENT=true`;
+  },
+});
+const JK = L.latLngBounds([32.2, 72.3], [37.2, 80.6]);
+const BH_ATTR = 'Official boundaries: <a href="https://bhuvan.nrsc.gov.in">Bhuvan, ISRO</a> / MapmyIndia';
+const OSM_ATTR = '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
+function freeBase() {
+  const osm = b => L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {minZoom: 8, maxZoom: 19, bounds: b, attribution: OSM_ATTR});
+  return L.layerGroup([
+    new BhuvanLayer("", {layer: "india3", maxZoom: 7, attribution: BH_ATTR}),
+    // OSM everywhere except the J&K box (three rectangles around it)
+    osm([[-60, 30], [32.2, 130]]), osm([[32.2, 30], [60, 72.3]]), osm([[32.2, 80.6], [60, 130]]),
+    new BhuvanLayer("", {layer: "india3", minZoom: 8, maxZoom: 19, maxNativeZoom: 16, bounds: JK, zIndex: 2, attribution: BH_ATTR}),
+    new BhuvanLayer("", {layer: "mmi:mmi_india", minZoom: 8, maxZoom: 19, maxNativeZoom: 17, bounds: JK, zIndex: 3}),
+  ]);
+}
+async function googleBase(key) {
+  let s = LS.get("gtiles", null);
+  if (!s || s.key !== key || Date.now() / 1000 > +s.expiry - 3600) {
+    const r = await fetch(`https://tile.googleapis.com/v1/createSession?key=${encodeURIComponent(key)}`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({mapType: "roadmap", language: "en-IN", region: "IN"}),
+    });
+    if (!r.ok) throw new Error("tiles " + r.status);
+    const j = await r.json();
+    s = {key, session: j.session, expiry: j.expiry};
+    LS.set("gtiles", s);
+  }
+  return L.tileLayer(`https://tile.googleapis.com/v1/2dtiles/{z}/{x}/{y}?session=${s.session}&key=${encodeURIComponent(key)}`,
+    {maxZoom: 21, attribution: "Map data © Google"});
+}
+let baseLayer = null;
+async function setBase() {
+  let next = null;
+  if (GKEY()) { try { next = await googleBase(GKEY()); } catch (e) { toast("Google map didn't load, so the free map is showing. Check the key's restrictions."); } }
+  next ||= freeBase();
+  if (baseLayer) map.removeLayer(baseLayer);
+  baseLayer = next.addTo(map);
+}
+setBase();
 const stLayer = L.layerGroup().addTo(map), tripLayer = L.layerGroup().addTo(map);
 let meMarker = null, meRing = null;
 
@@ -316,7 +398,10 @@ $("#wps").addEventListener("click", e => {
 });
 document.addEventListener("click", e => { if (!e.target.closest(".wp")) closeSugg(); });
 
-function choose(i, it) {
+async function choose(i, it) {
+  if (it.placeId && it.lat == null) {
+    try { Object.assign(it, await googlePlace(it.placeId)); } catch (e) { toast(e.message); return; }
+  }
   S.places[i] = it.gps ? {label: "My location", gps: true} : {label: it.label, sub: it.sub, lat: it.lat, lon: it.lon};
   closeSugg(); save(); renderWps();
   if (!it.gps) map.setView([it.lat, it.lon], Math.max(map.getZoom(), 11));
@@ -346,7 +431,7 @@ function bindVehicle() {
 
 function render() {
   const body = $("#body"), t = S.trip;
-  $("#sheet").classList.toggle("min", S.sheetMin);
+  panelState();
   if (!t) {
     const ready = S.places[0] && S.places[S.places.length - 1] && S.places.every(Boolean);
     body.innerHTML = `
@@ -432,6 +517,11 @@ function dataBlock() {
     <label class="btn" for="importFb">Import file</label><input id="importFb" type="file" accept=".json,.jsonl,application/json" hidden>
     <button class="btn" id="setHome" type="button" ${S.places[0] && !S.places[0].gps ? "" : "disabled"}>Save start as Home</button></div>
     ${S.home ? `<div class="muted">Home: ${esc(S.home.label)}</div>` : ""}
+    <div class="nf"><span style="color:var(--ink);font-weight:500">Colour theme</span><div class="row" role="group" aria-label="Colour theme">${THEMES.map(t => `<button type="button" class="btn${(S.theme || "auto") === t ? " primary" : ""}" data-theme-set="${t}" aria-pressed="${(S.theme || "auto") === t}">${THEME_LABEL[t]}</button>`).join("")}</div></div>
+    <div class="nf"><label for="gkey" style="font-weight:500">Google Maps key (optional)</label>
+      <div class="muted">${GKEY() ? "Key saved on this phone. The map and place search are using Google." : "Adds Google's map (official India boundaries) and Google place search. The key stays on this phone."}</div>
+      <div class="row"><input id="gkey" type="password" autocomplete="off" placeholder="${GKEY() ? "••••••••" : "Paste your browser key"}" style="flex:1;min-width:0;border:1px solid var(--line);background:var(--field);color:var(--ink);border-radius:8px;padding:8px 10px;font:14px var(--body)">
+      <button class="btn" id="gkeySave" type="button">Save</button>${GKEY() ? `<button class="btn" id="gkeyDel" type="button">Remove</button>` : ""}</div></div>
   </div></details>`;
 }
 
@@ -455,6 +545,13 @@ function bindData() {
     } catch (err) { toast("That file isn't a reports export."); }
   });
   $("#setHome")?.addEventListener("click", () => { S.home = {...S.places[0]}; save(); render(); toast("Home saved."); });
+  document.querySelectorAll("[data-theme-set]").forEach(b => b.addEventListener("click", () => { S.theme = b.dataset.themeSet; save(); applyTheme(); render(); }));
+  $("#gkeySave")?.addEventListener("click", async () => {
+    const v = $("#gkey").value.trim();
+    if (!/^AIza[\w-]{30,}$/.test(v)) { toast("That doesn't look like a Google API key. Keys start with AIza."); return; }
+    LS.set("gkey", v); LS.set("gtiles", null); await setBase(); render(); toast("Google key saved.");
+  });
+  $("#gkeyDel")?.addEventListener("click", async () => { LS.set("gkey", ""); LS.set("gtiles", null); await setBase(); render(); toast("Google key removed. Using the free map."); });
 }
 
 // ---------- actions ----------
@@ -617,18 +714,56 @@ document.addEventListener("click", e => {
   }
 });
 
-$("#handle").addEventListener("click", () => { S.sheetMin = !S.sheetMin; save(); render(); });
+// ---------- panel hide/show ----------
+function panelState() {
+  const t = S.trip, n = t?.stops[0] && QID[t.stops[0].id];
+  $("#sheet").classList.toggle("hidden", !!S.panelHidden);
+  $("#showPanel").hidden = !S.panelHidden;
+  $("#sheetTitle").textContent = t ? (t.active ? "Guidance on" : "Your trip") : "Plan";
+  $("#showLabel").textContent = n ? `Next fill: ${n.s.name}` : t ? "Show trip" : "Show panel";
+  requestAnimationFrame(placeFabs);
+}
+function placeFabs() {
+  const wide = innerWidth >= 900, h = wide || S.panelHidden ? (S.panelHidden && !wide ? 62 : 0) : $("#sheet").offsetHeight;
+  $("#locate").style.bottom = `calc(env(safe-area-inset-bottom,0px) + ${h + 14}px)`;
+  $("#theme").style.bottom = `calc(env(safe-area-inset-bottom,0px) + ${h + 68}px)`;
+  const tt = document.querySelector(".toast"); if (tt) tt.style.bottom = `${(wide ? 0 : h) + 14}px`;
+}
+$("#hidePanel").addEventListener("click", () => { S.panelHidden = true; save(); panelState(); });
+$("#showPanel").addEventListener("click", () => { S.panelHidden = false; save(); panelState(); });
+addEventListener("resize", placeFabs);
+
+// ---------- light / dark ----------
+const THEMES = ["auto", "light", "dark"], THEME_LABEL = {auto: "Match phone", light: "Light", dark: "Dark"};
+const osDark = matchMedia("(prefers-color-scheme: dark)");
+function applyTheme() {
+  const t = S.theme || "auto", dark = t === "dark" || (t === "auto" && osDark.matches);
+  if (t === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+  document.body.classList.toggle("dark-map", dark);
+  document.querySelector('meta[name="theme-color"]').content = dark ? "#101512" : "#0b6e4f";
+  $("#theme").innerHTML = dark
+    ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>`
+    : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>`;
+  $("#theme").setAttribute("aria-label", `Colour theme: ${THEME_LABEL[t]}. Tap to change.`);
+  if (Q.length) { drawStations(); drawTrip(); }
+  meMarker?.setStyle({fillColor: css("--route")});
+}
+$("#theme").addEventListener("click", () => {
+  S.theme = THEMES[(THEMES.indexOf(S.theme || "auto") + 1) % 3]; save(); applyTheme(); render();
+  toast(`Theme: ${THEME_LABEL[S.theme]}`);
+});
+osDark.addEventListener("change", () => { if ((S.theme || "auto") === "auto") applyTheme(); });
 $("#locate").addEventListener("click", async () => { try { const m = await gpsOnce(); map.setView(m, 13); } catch (e) { toast(e.message); } });
 
 let toastTimer;
 function toast(msg) {
   document.querySelector(".toast")?.remove();
   const t = document.createElement("div"); t.className = "toast"; t.setAttribute("role", "status"); t.textContent = msg;
-  document.body.appendChild(t); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.remove(), 4500);
+  document.body.appendChild(t); placeFabs(); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.remove(), 4500);
 }
 
 // ---------- boot ----------
-renderWps(); render();
+applyTheme(); renderWps(); render();
 fetch("stations.json").then(r => r.json()).then(d => {
   DATA = d; quality(); drawStations(); render();
   if (S.trip) { drawTrip(); fitTrip(); if (S.trip.active) startGuidance(); }
