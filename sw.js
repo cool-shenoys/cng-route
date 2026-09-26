@@ -1,5 +1,5 @@
 // Network-first cache so the app and station list still open with a weak signal on the highway.
-const C = "cng-route-v202609261200";
+const C = "cng-route-v202609261206";
 self.addEventListener("install", e => { e.waitUntil(caches.open(C).then(c => c.addAll(["./", "index.html", "app.js", "stations.json", "icon.svg", "manifest.json"]))); self.skipWaiting(); });
 self.addEventListener("activate", e => e.waitUntil(self.clients.claim()));
 self.addEventListener("fetch", e => {
