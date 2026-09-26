@@ -139,17 +139,68 @@ function planStops(L, startFill, excluded) {
                 backups: backups.map(b => ({id: b.q.s.id, km: b.km, off: b.off, arrive: left - (b.km - pos)}))});
     pos = best.km; left = range;
   }
-  return {stops, gaps, arrive: left - (L.total - pos)};
+  return {stops, gaps, arrive: left - (L.total - pos), cngCount: cands.filter(c => c.off <= detour).length};
 }
 
-async function osrm(points) {
+// Routing: Google Routes API when the user has added a key (real alternatives, traffic-aware times),
+// OSRM otherwise or if Google fails. Both return the same shape.
+async function route(points, alternatives) {
+  if (GKEY()) {
+    try { return await googleRoutes(points, alternatives); } catch (e) { console.warn("Google routing failed, using OSRM", e); }
+  }
+  return osrm(points, alternatives);
+}
+
+function decodePolyline(s) {
+  const out = [];
+  let i = 0, lat = 0, lon = 0;
+  while (i < s.length) {
+    for (const k of [0, 1]) {
+      let b, shift = 0, res = 0;
+      do { b = s.charCodeAt(i++) - 63; res |= (b & 31) << shift; shift += 5; } while (b >= 32);
+      const d = res & 1 ? ~(res >> 1) : res >> 1;
+      if (k === 0) lat += d; else lon += d;
+    }
+    out.push([lat / 1e5, lon / 1e5]);
+  }
+  return out;
+}
+
+async function googleRoutes(points, alternatives) {
+  const ll = p => ({location: {latLng: {latitude: p.lat, longitude: p.lon}}});
+  const body = {origin: ll(points[0]), destination: ll(points[points.length - 1]), intermediates: points.slice(1, -1).map(ll),
+    travelMode: "DRIVE", routingPreference: "TRAFFIC_AWARE", regionCode: "IN", languageCode: "en-IN",
+    computeAlternativeRoutes: !!alternatives && points.length === 2};
+  const r = await fetch("https://routes.googleapis.com/directions/v2:computeRoutes", {
+    method: "POST", body: JSON.stringify(body),
+    headers: {"Content-Type": "application/json", "X-Goog-Api-Key": GKEY(),
+      "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.distanceMeters,routes.description"},
+  });
+  if (!r.ok) throw new Error("routes " + r.status);
+  const j = await r.json();
+  if (!j.routes?.length) throw new Error("No road route between these places.");
+  return j.routes.map(rt => ({line: decodePolyline(rt.polyline.encodedPolyline), km: rt.distanceMeters / 1000,
+    min: parseInt(rt.duration) / 60, legs: rt.legs.map(l => (l.distanceMeters || 0) / 1000), via: rt.description || ""}));
+}
+
+// OSRM offers alternative routes only between two points (no intermediate stops).
+async function osrm(points, alternatives) {
   const c = points.map(p => `${p.lon.toFixed(5)},${p.lat.toFixed(5)}`).join(";");
-  const r = await fetch(`https://router.project-osrm.org/route/v1/driving/${c}?overview=full&geometries=geojson`);
+  const alt = alternatives && points.length === 2 ? "&alternatives=3&steps=true" : "";
+  const r = await fetch(`https://router.project-osrm.org/route/v1/driving/${c}?overview=full&geometries=geojson${alt}`);
   if (!r.ok) throw new Error(`Routing service returned ${r.status}. Try again in a few seconds.`);
   const j = await r.json();
   if (j.code !== "Ok") throw new Error(j.code === "NoRoute" ? "No road route between these places." : (j.message || j.code));
-  const rt = j.routes[0];
-  return {line: rt.geometry.coordinates.map(([lo, la]) => [la, lo]), km: rt.distance / 1000, min: rt.duration / 60, legs: rt.legs.map(l => l.distance / 1000)};
+  return j.routes.map(rt => ({line: rt.geometry.coordinates.map(([lo, la]) => [la, lo]), km: rt.distance / 1000, min: rt.duration / 60,
+    legs: rt.legs.map(l => l.distance / 1000), via: rt.legs.map(l => l.summary).filter(Boolean).join(", ")}));
+}
+
+// share of a route's points that lie on the previous route (used to keep a reroute on the road you chose)
+function overlap(prevLine, L) {
+  const P = prepLine(prevLine), step = Math.max(1, Math.floor(L.ll.length / 60));
+  let on = 0, n = 0;
+  for (let i = 0; i < L.ll.length; i += step) { n++; if (projectPoint(P, L.ll[i][0], L.ll[i][1]).off < 0.3) on++; }
+  return n ? on / n : 0;
 }
 
 let LCACHE = null;
@@ -158,8 +209,24 @@ function lineOf(trip) {
   return LCACHE.L;
 }
 
+// All route options between start and destination, each with its own CNG plan.
+async function buildOptions(start, fill, targets) {
+  const rts = await route([start, ...targets], true);
+  return rts.map(rt => tripFrom(rt, start, fill, targets, null));
+}
+
+// Re-plan mid-trip. Stays on the road the driver chose rather than jumping to whichever route is fastest.
 async function buildTrip(start, fill, targets, prev) {
-  const rt = await osrm([start, ...targets]);
+  const rts = await route([start, ...targets], !!prev);
+  let rt = rts[0];
+  if (prev?.line && rts.length > 1) {
+    const scored = rts.map(r => ({r, o: overlap(prev.line, prepLine(r.line))}));
+    rt = scored.reduce((a, b) => b.o > a.o + 0.1 ? b : a).r;
+  }
+  return tripFrom(rt, start, fill, targets, prev);
+}
+
+function tripFrom(rt, start, fill, targets, prev) {
   const L = prepLine(rt.line);
   const scale = L.total / rt.km;
   let acc = 0;
@@ -169,7 +236,7 @@ async function buildTrip(start, fill, targets, prev) {
   const trip = {
     rid: Math.random().toString(36).slice(2, 8), id: prev?.id || Math.random().toString(36).slice(2, 8),
     created: prev?.created || new Date().toISOString(), line: L.ll.map(p => [+p[0].toFixed(5), +p[1].toFixed(5)]),
-    total: L.total, min: rt.min, legEnds, targets, start: {lat: start.lat, lon: start.lon, label: start.label}, fill,
+    total: L.total, min: rt.min, via: rt.via || "", legEnds, targets, start: {lat: start.lat, lon: start.lon, label: start.label}, fill,
     ...plan, excluded: [...excluded], skipped: prev?.skipped || [], log: prev?.log || [], prompted: {}, active: prev?.active || false,
   };
   LCACHE = {id: trip.rid, L};
@@ -314,7 +381,20 @@ function drawTrip() {
   tripLayer.clearLayers();
   const t = S.trip;
   if (!t) return;
-  L.polyline(t.line, {color: css("--route"), weight: 6, opacity: .9}).addTo(tripLayer);
+  const opts = S.tripOptions || [];
+  opts.forEach((o, i) => {
+    if (o.rid === t.rid) return;
+    const pl = L.polyline(o.line, {color: css("--alt"), weight: 7, opacity: .85}).addTo(tripLayer).on("click", () => selectRoute(i));
+    L.polyline(o.line, {weight: 22, opacity: 0}).addTo(tripLayer).on("click", () => selectRoute(i)); // fat invisible hit area for fingers
+    const mid = o.line[Math.floor(o.line.length * (0.35 + 0.15 * i))];
+    L.tooltip({permanent: true, direction: "center", className: "rtip", interactive: true}).setLatLng(mid).setContent(fmtDur(o.min)).addTo(tripLayer)
+      .getElement()?.addEventListener("click", () => selectRoute(i));
+  });
+  L.polyline(t.line, {color: css("--route"), weight: 7, opacity: .95}).addTo(tripLayer);
+  if (opts.length > 1) {
+    const mid = t.line[Math.floor(t.line.length * 0.5)];
+    L.tooltip({permanent: true, direction: "center", className: "rtip sel"}).setLatLng(mid).setContent(fmtDur(t.min)).addTo(tripLayer);
+  }
   L.circleMarker([t.start.lat, t.start.lon], {radius: 7, color: "#fff", weight: 2, fillColor: css("--route"), fillOpacity: 1}).addTo(tripLayer).bindPopup(esc(t.start.label));
   t.targets.forEach((p, i) => {
     const last = i === t.targets.length - 1;
@@ -457,6 +537,7 @@ function render() {
     ...t.targets.map((p, i) => ({kind: i === t.targets.length - 1 ? "dest" : "stop", km: t.legEnds[i], p, i})),
   ].sort((a, b) => a.km - b.km);
   body.innerHTML = `
+    ${routeCards(t)}
     <div class="stat"><div><b>${fmtKm(t.total)} km</b><span>to ${esc(t.targets[t.targets.length - 1].label)}</span></div>
       <div><b>${fmtDur(t.min)}</b><span>driving</span></div>
       <div><b>${t.stops.length}</b><span>CNG fill${t.stops.length === 1 ? "" : "s"}</span></div></div>
@@ -484,9 +565,42 @@ function render() {
       <button class="btn" id="endTrip" type="button">End trip</button>
     </div>
     ${t.active ? `<div class="muted">Guidance is on: keep this page open. When you reach a fill stop it will ask if you filled.</div>` : ""}`;
+  document.querySelectorAll("[data-route]").forEach(b => b.addEventListener("click", () => selectRoute(+b.dataset.route)));
   $("#startTrip")?.addEventListener("click", startGuidance);
   $("#endTrip").addEventListener("click", endTrip);
   $("#replan").addEventListener("click", replanHere);
+}
+
+// ---------- route options ----------
+function routeTags(opts) {
+  const tags = opts.map(() => []);
+  const best = (f, better) => opts.reduce((bi, o, i) => better(f(o), f(opts[bi])) ? i : bi, 0);
+  tags[best(o => o.min, (a, b) => a < b)].push("Fastest");
+  const sh = best(o => o.total, (a, b) => a < b);
+  if (opts[sh].total < opts[best(o => o.min, (a, b) => a < b)].total - 2) tags[sh].push("Shortest");
+  const cng = best(o => o.cngCount / Math.max(o.total, 1), (a, b) => a > b);
+  tags[cng].push("Most CNG stations");
+  opts.forEach((o, i) => { if (o.gaps.length) tags[i].push("CNG gap"); });
+  return tags;
+}
+
+function routeCards(t) {
+  const opts = S.tripOptions;
+  if (!opts || opts.length < 2 || t.active) return "";
+  const tags = routeTags(opts);
+  return `<div><div class="label-sm">${opts.length} routes · tap to choose</div><div class="routes">${opts.map((o, i) => `
+    <button type="button" class="ropt" data-route="${i}" aria-pressed="${o.rid === t.rid}">
+      <span class="rt">${fmtDur(o.min)}</span><span class="rk">${fmtKm(o.total)} km</span>
+      <span class="rs">${o.via ? `via ${esc(o.via)}` : `Route ${i + 1}`}</span>
+      <span class="rs">${o.stops.length} fill${o.stops.length === 1 ? "" : "s"} · ${o.cngCount} CNG stations nearby</span>
+      ${tags[i].length ? `<span class="rtags">${tags[i].map(g => `<span class="chip${g === "CNG gap" ? " bad" : ""}">${g}</span>`).join("")}</span>` : ""}
+    </button>`).join("")}</div></div>`;
+}
+
+function selectRoute(i) {
+  const o = S.tripOptions?.[i];
+  if (!o || o.rid === S.trip?.rid) return;
+  S.trip = o; LCACHE = null; save(); drawTrip(); render();
 }
 
 function fillItem(st, i) {
@@ -560,7 +674,9 @@ async function plan() {
   btn.disabled = true; btn.innerHTML = `<span class="spin"></span> Planning`;
   try {
     const pts = await Promise.all(S.places.map(resolvePlace));
-    S.trip = await buildTrip(pts[0], S.vehicle.fill, pts.slice(1), null);
+    const opts = await buildOptions(pts[0], S.vehicle.fill, pts.slice(1));
+    S.tripOptions = opts.length > 1 ? opts : null;
+    S.trip = opts[0];
     save(); drawTrip(); fitTrip(); render();
   } catch (e) { toast(e.message); render(); }
 }
@@ -581,7 +697,7 @@ async function nearMe() {
 }
 
 function startGuidance() {
-  S.trip.active = true; save();
+  S.trip.active = true; S.tripOptions = null; save(); drawTrip();
   if (navigator.geolocation && watchId == null)
     watchId = navigator.geolocation.watchPosition(onPos, () => toast("Location is off, so guidance can't track you. Tap “I'm here” at each stop instead."), {enableHighAccuracy: true, maximumAge: 10000});
   try { navigator.wakeLock?.request("screen").catch(() => {}); } catch (e) {}
@@ -608,6 +724,7 @@ async function replanHere() {
       const t = S.trip, L = lineOf(t), here = projectPoint(L, m[0], m[1]);
       const targets = t.targets.filter((p, i) => t.legEnds[i] > here.km + 0.5);
       S.trip = await buildTrip({lat: m[0], lon: m[1], label: "My location"}, fill, targets.length ? targets : t.targets.slice(-1), t);
+      S.tripOptions = null;
       save(); drawTrip(); render(); toast("Replanned from your location.");
     });
   } catch (e) { toast(e.message); }
@@ -615,7 +732,7 @@ async function replanHere() {
 
 function endTrip() {
   const past = LS.get("trips", []); past.push({...S.trip, line: undefined}); LS.set("trips", past.slice(-20));
-  S.trip = null; save();
+  S.trip = null; S.tripOptions = null; save();
   if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
   drawTrip(); render();
 }
@@ -697,6 +814,7 @@ async function submit(id, event, opts) {
   toast("Saved. Rerouting…");
   try {
     S.trip = await buildTrip({lat: q.s.lat, lon: q.s.lon, label: q.s.name}, fill, targets.length ? targets : t.targets.slice(-1), t);
+    S.tripOptions = null;
     save(); drawTrip(); render();
     const n = S.trip.stops[0];
     toast(n ? `Next fill: ${QID[n.id].s.name}, ${fmtKm(n.km)} km ahead.` : "No more fills needed to reach your destination.");
